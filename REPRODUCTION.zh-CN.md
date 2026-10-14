@@ -250,8 +250,6 @@ bash run_physical_lvs_local.sh
 bash run_physical_lvs_local.sh --skip-route
 ```
 
-`local/extracted_lvs/` 是早期失败诊断产物，不代表最终结果；最终依据是 `local/physical_lvs/`。
-
 ### F. 最终网表门级功能仿真
 
 ```bash
@@ -274,7 +272,7 @@ bash run_power_ir_local.sh
 
 依次运行 `run_power_local.tcl`、`run_power_grid_local.tcl`、`run_ir_drop_local.tcl`；输入是修复版 ODB/SPEF、完整 PDK 的 TT Liberty 和 15 ns 约束。
 
-输出：`local/power_ir/power.rpt`、`power.log`、`power_grid.log`、`ir_drop.log` 及电压/错误报告。单项命令：
+输出：`local/power_ir/power.rpt`、`power.log`、`power_grid.log`、`ir_drop.log` 及电压/错误报告。相当于依次执行单项命令：
 
 ```bash
 mkdir -p local/power_ir
@@ -295,7 +293,7 @@ bash run_gds_export_local.sh
 输出：`local/gds/SHA256_final.gds`。KLayout 重新读完整文件，核对顶层、实例数、边界、大小和 SHA-256，写 `validation.json`/`validation.log`。
 
 ```bash
-# 有桌面环境时查看
+# 有桌面环境时才能用
 klayout local/gds/SHA256_final.gds
 ```
 
@@ -375,7 +373,7 @@ openroad -gui -no_init show_heatmaps_local.tcl
 | 图 | `render_heatmaps_local.tcl`、`plot_heatmaps_local.py`、`show_heatmaps_local.tcl`、`run_heatmaps_local.sh` |
 | 文档 | 本文、`LVS_LOCAL.md`、`POWER_GDS_LOCAL.md`、`HEATMAPS_LOCAL.md` |
 
-原 `synth.ys`、`openroad_flow_15ns_signoff.tcl`、`run_all.sh`、旧提取和功耗脚本没有被覆盖，新脚本作为替代入口。
+原 `synth.ys`、`openroad_flow_15ns_signoff.tcl`、`run_all.sh`、旧提取和功耗脚本没有被覆盖，新脚本作为替代入口。新增 `flow/run_all_local.sh` 串联本次修复版流程。
 
 ## 6. 本次结果及证据
 
@@ -405,7 +403,31 @@ cd /root/eda/SHA-256/flow
 
 尚未完成：SDF 回标、形式等价检查、最终 GDS 独立重新读入 DRC/LVS、真实工作负载功耗、封装/动态 IR、多块 RTL 修复。现有 PASS 不代替这些项目。
 
-## 7. 一段命令重跑设计阶段
+## 7. 修复版一键入口与逐阶段命令
+
+新增的一键入口是 `flow/run_all_local.sh`，原 `run_all.sh` 保留对照。工具默认从本机 ORFS 安装目录查找，不依赖指向源码目录的 `OPENROAD` 变量；可用 `ORFS_ROOT`、`OPENROAD_EXE`、`YOSYS_EXE`、`PDK_ROOT` 覆盖对应设置。底层 Tcl/综合脚本仍含本机路径，换机器时必须修改。
+
+```bash
+cd /root/eda/SHA-256/flow
+bash run_all_local.sh --help
+bash run_all_local.sh --dry-run       # 只列步骤，不执行、不写结果
+bash run_all_local.sh --check-only    # 检查依赖、PDK 和复用输入
+bash run_all_local.sh                 # 完整流程，会重做设计阶段
+```
+
+若当前 `python3` 没有 Matplotlib，先激活绘图环境，或使用 `--skip-heatmaps`。其他选项：
+
+```bash
+bash run_all_local.sh --skip-synth    # 复用综合网表，仍重做 PnR 和下游
+bash run_all_local.sh --signoff-only  # 复用 route_repaired，只重做 DRC/LVS 和后续
+bash run_all_local.sh --skip-heatmaps # 跳过热力图
+```
+
+`--signoff-only` 不重做 RTL、综合、综合后仿真、PnR、布线修复和 STA；底层物理检查使用 `--skip-route`。只有设计输入未改变、修复版产物完整时才应复用；入口只检查文件存在，不证明与当前 RTL 一致。
+
+入口在阶段返回非零时立即停止，打印该阶段日志末尾，并保留失败退出码。每次运行的阶段日志和 `summary.txt` 独立保存在 `local/full_flow/时间_PID/`；其中 `pnr.log` 是本次主 PnR 日志，独立入口生成的 `local/pnr.log` 不会被该一键流程更新。各分析脚本仍写入原有 `local/` 子目录，重复运行会覆盖相应产物。已通过语法、依赖预检以及模拟阶段的顺序/跳过/失败停止验证；新增编排入口尚未整套重跑实际 EDA 流程。
+
+以下保留逐阶段完整命令：
 
 已完成安装、应用补丁后执行；遇到失败会停止。重做 PnR 后不得混用上次下游报告。
 
