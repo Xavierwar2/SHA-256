@@ -1,0 +1,22 @@
+read_verilog -sv -I../Verilog ../Verilog/SHA256.v
+hierarchy -check -top SHA256
+proc
+flatten          # RESTORED: expansion protected by (* keep_hierarchy *)
+opt
+fsm
+opt
+memory
+opt
+techmap
+opt
+dfflibmap -liberty /root/eda/OpenROAD-flow-scripts/tools/OpenROAD/test/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+opt
+abc -liberty /root/eda/OpenROAD-flow-scripts/tools/OpenROAD/test/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib -script +strash;scorr;ifraig;retime,;map;print_stats
+opt
+
+# Insert tie cells (conb) for constants 1/0 to avoid OpenROAD DRT-0305
+hilomap -hicell sky130_fd_sc_hd__conb_1 HI -locell sky130_fd_sc_hd__conb_1 LO
+
+clean
+stat
+write_verilog -noattr local/SHA256_synth.v

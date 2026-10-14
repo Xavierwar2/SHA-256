@@ -117,3 +117,7 @@ flow/lvs.py
 flow/schematic_cdl_v3_libcdl_aligned.py
 flow/netgen_run_lvs.sh
 flow/strip_parasitics.py
+
+# Required local LVS dependency and its regression tests must be versioned.
+!flow/lvs.py
+!flow/test_lvs.py

@@ -11,16 +11,17 @@ Key approach (proven by v6pos on 14.3ns flow):
   * Top-level .SUBCKT SHA256 port list: 70 pins from parse_def
     (clk data_in[0..31] data_out[0..31] data_oe rd rst soc eoc).
   * Physical-only cells stripped on both sides.
-  * Supply pins filled with PIN NAME as global net (VPWR/VGND convention).
+  * Supply connections must be explicitly exported in both inputs.
+  * This checks DEF connectivity against post-route Verilog, not extracted metal.
 """
-import os, re, sys, subprocess, collections
+import os, re, sys, subprocess, collections, argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from lvs import parse_def, parse_verilog
 
-PDK_ROOT = "/usr/local/share/pdk"
+PDK_ROOT = os.environ.get("PDK_ROOT", "/usr/local/share/pdk")
 SKY130A  = os.path.join(PDK_ROOT, "sky130A")
 LIBCDL   = os.path.join(SKY130A, "libs.ref", "sky130_fd_sc_hd", "cdl", "sky130_fd_sc_hd.cdl")
 DEF_FILE     = os.path.join(HERE, "SHA256_15ns.def")
@@ -59,7 +60,7 @@ def parse_libcdl(path):
     return port_map
 
 def write_cdl(path, side_label, instances, top_ports, top_name, master_ports,
-              include_libcdl_path=None):
+              include_libcdl_path=None, open_pins=frozenset()):
     port_names = [p for (p, _) in top_ports]
     lines = []
     lines.append("* ==========================================================")
@@ -89,24 +90,21 @@ def write_cdl(path, side_label, instances, top_ports, top_name, master_ports,
             skipped += 1
             continue
         if macro not in master_ports:
-            unknown[macro] += 1
-            raw = [pin_dict.get(k, "__NC__") for k in list(pin_dict.keys())]
-            lines.append(f"* [WARN] master {macro} not in libcdl (raw fallback)")
-            lines.append(f"X{iname} " + " ".join(raw) + f" {macro}")
-            continue
+            raise ValueError(f"Unknown standard cell {macro} in {side_label}")
         plist = master_ports[macro]
+        extra = set(pin_dict) - set(plist)
+        if extra:
+            raise ValueError(f"Unknown {side_label} pins on {iname}/{macro}: {sorted(extra)}")
         out_nets = []
         for pname in plist:
             if pname in pin_dict:
                 out_nets.append(pin_dict[pname])
             else:
-                if pname == "VNB":
-                    out_nets.append("VGND")
-                elif pname == "VPB":
-                    out_nets.append("VPWR")
+                if (iname, pname) in open_pins:
+                    # Deliberately floating clock-load outputs need distinct nodes.
+                    out_nets.append(f"__OPEN_{iname}_{pname}")
                 else:
-                    out_nets.append(pname)
-                supply_fills[f"{macro}::{pname}"] += 1
+                    raise ValueError(f"Missing {side_label} pin {iname}/{pname}; export using -include_pwr_gnd")
         lines.append(f"X{iname} " + " ".join(out_nets) + f" {macro}")
         written += 1
 
@@ -120,7 +118,22 @@ def write_cdl(path, side_label, instances, top_ports, top_name, master_ports,
              "total_supply_fills": sum(supply_fills.values())}
     return stats
 
+def report_matches(report):
+    results = re.findall(r"^Final result:\s*([^\n]+)", report, re.M)
+    return bool(results) and results[-1].strip() == "Circuits match uniquely."
+
+
 def main():
+    global DEF_FILE, VERILOG_FILE, OUT_LAYOUT, OUT_SCHEMATIC, REPORT
+    args = argparse.ArgumentParser(description="DEF vs post-route Verilog connectivity LVS (not extracted-metal LVS)")
+    args.add_argument("--data-dir", default=os.path.join(HERE, "local"))
+    options = args.parse_args()
+    data_dir = os.path.abspath(options.data_dir)
+    DEF_FILE = os.path.join(data_dir, "SHA256_15ns.def")
+    VERILOG_FILE = os.path.join(data_dir, "SHA256_15ns_final.v")
+    OUT_LAYOUT = os.path.join(data_dir, "SHA256_15ns.layout.v6pos.cdl")
+    OUT_SCHEMATIC = os.path.join(data_dir, "SHA256_15ns.schematic.v6pos.cdl")
+    REPORT = os.path.join(data_dir, "SHA256_15ns.netgen_lvs.v6pos.report")
     print("[V6-pos-15ns] Step 1: build libcdl port map")
     master_ports = parse_libcdl(LIBCDL)
     print(f"              libcdl .SUBCKT entries: {len(master_ports)}")
@@ -128,6 +141,25 @@ def main():
     print("[V6-pos-15ns] Step 2: Parse DEF (layout) + Verilog (schematic)")
     linst, lnet, lport, ldn = parse_def(DEF_FILE)
     sinst, snet, sport, sdn = parse_verilog(VERILOG_FILE)
+    supplies = {("VDD", "INOUT"), ("VSS", "INOUT")}
+    # OpenROAD may emit supplies as internal wires instead of module ports.
+    # Treat the explicitly connected supply nets as virtual CDL boundary pins.
+    if ldn != sdn or set(lport) - supplies != set(sport) - supplies:
+        raise ValueError(f"Top-level interface mismatch: DEF={ldn, lport}, Verilog={sdn, sport}")
+    if not {"VDD", "VSS"}.issubset(snet) or not {"VDD", "VSS"}.issubset(lnet):
+        raise ValueError("Expected explicitly connected VDD/VSS nets in both exports")
+    open_pins = set()
+    for name, (master, pins) in linst.items():
+        if is_physical(name, master):
+            continue
+        if name not in sinst or sinst[name][0] != master:
+            raise ValueError(f"Instance {name}/{master} missing or changed in Verilog")
+        for pin in master_ports.get(master, []):
+            if pin not in pins and pin not in sinst[name][1]:
+                if pin in ("VGND", "VNB", "VPWR", "VPB"):
+                    raise ValueError(f"Unconnected supply pin {name}/{pin}")
+                open_pins.add((name, pin))
+    print(f"              Pins floating in both exports: {len(open_pins)}")
     top_name = ldn or sdn or "SHA256"
     print(f"              Layout parsed: {len(linst)} insts, {len(lport)} top ports")
     print(f"              Schem  parsed: {len(sinst)} insts, {len(sport)} top decls")
@@ -139,7 +171,7 @@ def main():
 
     print("[V6-pos-15ns] Step 3a: Write layout CDL (positional pin + .INCLUDE libcdl)")
     lst = write_cdl(OUT_LAYOUT, "LAYOUT", linst, top_ports, top_name, master_ports,
-                    include_libcdl_path=LIBCDL)
+                    include_libcdl_path=LIBCDL, open_pins=open_pins)
     print(f"              layout: {lst['written']} insts written, "
           f"{lst['skipped']} phy skipped, fills={lst['total_supply_fills']}")
     if lst["unknown"]:
@@ -147,24 +179,23 @@ def main():
 
     print("[V6-pos-15ns] Step 3b: Write schematic CDL (positional pin + .INCLUDE libcdl)")
     sst = write_cdl(OUT_SCHEMATIC, "SCHEMATIC", sinst, top_ports, top_name,
-                    master_ports, include_libcdl_path=LIBCDL)
+                    master_ports, include_libcdl_path=LIBCDL, open_pins=open_pins)
     print(f"              schematic: {sst['written']} insts written, "
           f"{sst['skipped']} phy skipped, fills={sst['total_supply_fills']}")
     if sst["unknown"]:
         print(f"              WARNING unknown schem macros: {sst['unknown']}")
 
     print("[V6-pos-15ns] Step 4: Run Netgen LVS -blackbox")
-    shell_cmd = (
-        f'netgen -batch lvs '
-        f'"{OUT_LAYOUT} {top_name}" '
-        f'"{OUT_SCHEMATIC} {top_name}" '
-        f'{SETUP} {REPORT} -blackbox'
-    )
-    print("              CMD: " + shell_cmd)
+    command = [os.environ.get("NETGEN", "netgen"), "-batch", "lvs",
+               f"{OUT_LAYOUT} {top_name}", f"{OUT_SCHEMATIC} {top_name}",
+               SETUP, REPORT, "-blackbox"]
+    print("              CMD: " + repr(command))
     sys.stdout.flush()
     env = os.environ.copy()
     env["MAGIC_EXT_USE_GDS"] = "1"
-    rc = subprocess.call(shell_cmd, shell=True, cwd=HERE, env=env)
+    if os.path.exists(REPORT):
+        os.remove(REPORT)
+    rc = subprocess.call(command, cwd=data_dir, env=env)
     print(f"[V6-pos-15ns] Netgen exit = {rc}")
 
     if os.path.exists(REPORT):
@@ -175,7 +206,18 @@ def main():
             sys.stdout.write(l)
     else:
         print("(no report produced)")
-    return rc
+    if rc:
+        return rc
+    if not os.path.exists(REPORT):
+        print("FAIL: Netgen did not generate a report")
+        return 1
+    with open(REPORT) as f:
+        report = f.read()
+    if not report_matches(report):
+        print("FAIL: Netgen report did not confirm a unique circuit match")
+        return 1
+    print("PASS: DEF and post-route Verilog connectivity match (standard-cell level)")
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
